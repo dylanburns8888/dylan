@@ -473,6 +473,239 @@ def main():
         except (EOFError, KeyboardInterrupt):
             speak("Exiting.")
             break
+# Local AI extension for Jarvis: add to jarvis.py or import from it.
+# Requires either `gpt4all` or `llama-cpp-python` and a local ggml model file.
+import threading
+import time
+import sqlite3
+import json
+from datetime import datetime
 
+# Try to import gpt4all first, then llama.cpp
+LOCAL_AI_ENGINE = None
+try:
+    from gpt4all import GPT4All
+    LOCAL_AI_ENGINE = "gpt4all"
+except Exception:
+    try:
+        from llama_cpp import Llama
+        LOCAL_AI_ENGINE = "llama"
+    except Exception:
+        LOCAL_AI_ENGINE = None
+
+# Globals for the model instance (lazy loaded)
+_ai_lock = threading.Lock()
+_ai_model = None
+_ai_ready = False
+_ai_config = config.setdefault("local_ai", {
+    "model_type": "gpt4all",
+    "model_path": "models/gpt4all.bin",
+    "max_tokens": 512,
+    "temperature": 0.7,
+    "conversation_memory_size": 6
+})
+
+# Add conversation table to the same DB used by jarvis
+def init_ai_db_tables():
+    with db_lock:
+        cur = db.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS conversation (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT,
+            content TEXT,
+            created_at TEXT
+        )
+        """)
+        db.commit()
+
+init_ai_db_tables()
+
+def _load_gpt4all_model(path):
+    global _ai_model, _ai_ready
+    try:
+        model = GPT4All(model=path)
+        _ai_model = ("gpt4all", model)
+        _ai_ready = True
+        print("[AI] gpt4all model loaded:", path)
+    except Exception as e:
+        print("[AI] Failed to load gpt4all model:", e)
+
+def _load_llama_model(path):
+    global _ai_model, _ai_ready
+    try:
+        model = Llama(model_path=path)
+        _ai_model = ("llama", model)
+        _ai_ready = True
+        print("[AI] llama model loaded:", path)
+    except Exception as e:
+        print("[AI] Failed to load llama model:", e)
+
+def init_local_ai(async_load=True):
+    """
+    Initialize (or load) the chosen local model.
+    Call this at startup. If async_load True it will spawn a thread to load the model to avoid blocking boot.
+    """
+    global _ai_config, LOCAL_AI_ENGINE
+    init_ai_db_tables()
+    if _ai_config.get("model_type") == "gpt4all":
+        engine = "gpt4all"
+    else:
+        engine = "llama"
+    # If environment doesn't have packages, override with available
+    if LOCAL_AI_ENGINE and engine != LOCAL_AI_ENGINE:
+        engine = LOCAL_AI_ENGINE
+    model_path = _ai_config.get("model_path")
+    if not model_path or not os.path.exists(model_path):
+        print(f"[AI] Model path {model_path} not found. Set config.local_ai.model_path to your model file.")
+        return
+    if async_load:
+        t = threading.Thread(target=_load_gpt4all_model if engine == "gpt4all" else _load_llama_model, args=(model_path,), daemon=True)
+        t.start()
+    else:
+        if engine == "gpt4all":
+            _load_gpt4all_model(model_path)
+        else:
+            _load_llama_model(model_path)
+
+def _store_conversation(role, content):
+    now = datetime.utcnow().isoformat()
+    with db_lock:
+        cur = db.cursor()
+        cur.execute("INSERT INTO conversation(role,content,created_at) VALUES(?,?,?)", (role, content, now))
+        db.commit()
+
+def _get_recent_conversation(n=None):
+    n = n or _ai_config.get("conversation_memory_size", 6)
+    with db_lock:
+        cur = db.cursor()
+        cur.execute("SELECT role, content FROM conversation ORDER BY id DESC LIMIT ?", (n,))
+        rows = cur.fetchall()
+    # rows are newest-first; reverse to oldest-first
+    rows.reverse()
+    return rows
+
+def ai_respond(user_prompt, max_tokens=None, temperature=None):
+    """
+    Generate a reply using the loaded local model.
+    Returns the text reply or None on error/not-ready.
+    This function is synchronous (blocking) but quick for small models.
+    """
+    global _ai_model, _ai_ready, _ai_config
+    if not _ai_ready or _ai_model is None:
+        print("[AI] Model not ready.")
+        return None
+    max_tokens = max_tokens or _ai_config.get("max_tokens", 512)
+    temperature = temperature if temperature is not None else _ai_config.get("temperature", 0.7)
+
+    # Build a simple chat prompt from recent conversation
+    history = _get_recent_conversation()
+    prompt_lines = []
+    for role, content in history:
+        if role == "user":
+            prompt_lines.append("User: " + content)
+        else:
+            prompt_lines.append("Assistant: " + content)
+    prompt_lines.append("User: " + user_prompt)
+    prompt_lines.append("Assistant:")
+    prompt = "\n".join(prompt_lines)
+
+    try:
+        engine_name, model = _ai_model
+        if engine_name == "gpt4all":
+            # gpt4all simple usage
+            # .generate returns text or iterates; use generate(...) with options for newer versions
+            resp = model.generate(prompt, max_tokens=max_tokens, temperature=temperature)
+            # model.generate can return an iterator or a string depending on version; coerce to str
+            reply = str(resp).strip()
+        else:
+            # llama-cpp-python usage
+            out = model.create(prompt=prompt, max_tokens=max_tokens, temperature=temperature)
+            reply = out.get("choices", [{}])[0].get("text", "").strip()
+    except Exception as e:
+        print("[AI] generation error:", e)
+        return None
+
+    # store the user + assistant parts in conversation DB
+    _store_conversation("user", user_prompt)
+    _store_conversation("assistant", reply)
+    return reply
+
+# Helper wrapper to ask and speak
+def ask_and_speak(question):
+    reply = ai_respond(question)
+    if reply:
+        speak(reply)
+    else:
+        speak("Sorry, I couldn't generate a response. Is the model loaded?")
+
+# Add parsing hooks into parse_and_execute: new commands
+# Insert these conditions into parse_and_execute (or replace parse_and_execute with this snippet)
+def parse_and_execute_with_ai(cmd_line):
+    parts = cmd_line.strip().split()
+    if not parts:
+        return
+    cmd = parts[0].lower()
+    args = parts[1:]
+    # New AI commands
+    if cmd == "ask" and args:
+        question = " ".join(args)
+        ask_and_speak(question)
+        return
+    if cmd == "chat_start":
+        speak("Starting a short chat session. I will remember the next messages.")
+        return
+    if cmd == "chat_clear":
+        # clear conversation history
+        with db_lock:
+            cur = db.cursor()
+            cur.execute("DELETE FROM conversation")
+            db.commit()
+        speak("Conversation memory cleared.")
+        return
+    if cmd == "set_model":
+        # set_model <type> <path>
+        if len(args) >= 2:
+            mtype = args[0]
+            mpath = args[1]
+            config.setdefault("local_ai", {})["model_type"] = mtype
+            config["local_ai"]["model_path"] = mpath
+            save_config(config)
+            speak(f"Model config updated: {mtype} {mpath}. Please restart or call load_model.")
+        else:
+            speak("Usage: set_model <gpt4all|llama> <path>")
+        return
+    if cmd == "load_model":
+        # load_model [path]
+        mpath = args[0] if args else config.get("local_ai", {}).get("model_path")
+        if not mpath:
+            speak("No model path set. Use set_model first.")
+            return
+        config.setdefault("local_ai", {})["model_path"] = mpath
+        save_config(config)
+        speak("Loading model (this may take a while)...")
+        init_local_ai(async_load=True)
+        return
+
+    # Fallback to the original parse handler
+    parse_and_execute(cmd_line)
+
+# To gracefully shutdown AI resources (if model needs to be closed)
+def ai_shutdown():
+    global _ai_model, _ai_ready
+    try:
+        if _ai_model:
+            engine_name, model = _ai_model
+            # gpt4all / llama typically don't require explicit close, but some versions do
+            try:
+                if engine_name == "gpt4all" and hasattr(model, "close"):
+                    model.close()
+                if engine_name == "llama" and hasattr(model, "close"):
+                    model.close()
+            except Exception:
+                pass
+    finally:
+        _ai_model = None
+        _ai_ready = False
 if __name__ == "__main__":
     main()
